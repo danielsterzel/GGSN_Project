@@ -1,17 +1,25 @@
-import numpy
-import cv2
-import pandas
-import seaborn
-import matplotlib.pyplot as plt
-import tensorflow
-import tensorflow.keras
-from sklearn.model_selection import train_test_split
+from fastapi import FastAPI, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import RedirectResponse
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-from ModelCreation.ViT import ViT
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    return {
+        "filename": file.filename,
+        "content_type": file.content_type,
+    }
 
-
-encoder = ViT().config(shape=(128,128), patch_size=20)
-
-
-
+@app.get("/")
+async def root():
+    return RedirectResponse("http://localhost:5173")
