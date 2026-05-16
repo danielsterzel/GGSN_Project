@@ -20,6 +20,7 @@ async def upload_image(file: UploadFile = File(...)):
         "content_type": file.content_type,
     }
 
+
 @app.get("/")
 async def root():
     return RedirectResponse("http://localhost:5173")
