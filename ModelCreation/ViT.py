@@ -5,8 +5,47 @@ from tensorflow.keras.layers import Conv2D, BatchNormalization, ReLU, MaxPooling
 from Preprocessing.Preprocessor import Preprocessor
 
 
+class TransformBlock(tf.keras.layers.Layer):
+
+    def __init__(self, num_heads=8, embedding_dim=256):
+
+        super().__init__()
+
+        self.norm1 = tf.keras.layers.LayerNormalization()
+
+        self.attention = tf.keras.layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=embedding_dim // num_heads
+        )
+
+        self.norm2 = tf.keras.layers.LayerNormalization()
+
+        self.mlp = tf.keras.Sequential(
+            [
+                tf.keras.layers.Dense(embedding_dim * 4, activation="relu"),
+                tf.keras.layers.Dense(embedding_dim),
+            ]
+        )
+
+    def call(self, x):
+
+        attention_output = self.attention(self.norm1(x), self.norm1(x))
+        x = x + attention_output
+
+        mlp_output = self.mlp(self.norm2(x))
+        x = x + mlp_output
+
+        return x
+
+
 class ViT(tf.keras.Model):
-    def __init__(self, image_size=256, patch_size=16, embedding_dim=256):
+    def __init__(
+        self,
+        num_classes,
+        image_size=256,
+        patch_size=16,
+        embedding_dim=256,
+        num_transformer_blocks=4,
+    ):
 
         super().__init__()
 
@@ -21,9 +60,14 @@ class ViT(tf.keras.Model):
         self.position_embedding = tf.Variable(
             tf.random.normal([1, self.num_patches, embedding_dim]), trainable=True
         )
-        self.attention = tf.keras.layers.MultiHeadAttention(
-            num_heads=8, key_dim=self.embedding_dim
-        )
+
+        self.num_transformer_blocks = num_transformer_blocks
+        self.transformer_blocks = [
+            TransformBlock(embedding_dim=embedding_dim)
+            for _ in range(num_transformer_blocks)
+        ]
+
+        self.classifier = tf.keras.layers.Dense(num_classes)
 
     def _prepare_embedded_vectors(self, img):
         patches = Preprocessor.patchify(
@@ -42,7 +86,14 @@ class ViT(tf.keras.Model):
 
     def call(self, img):
 
-        embedded = self._prepare_embedded_vectors(img)
-        attention_output = self.attention(embedded, embedded)
+        x = self._prepare_embedded_vectors(img)
 
-        return attention_output
+        for block in self.transformer_blocks:
+            x = block(x)
+
+        x = tf.reduce_mean(x, axis=1)
+        x = self.classifier(x)
+
+        return x
+
+        return x
