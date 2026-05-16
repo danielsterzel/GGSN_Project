@@ -1,6 +1,5 @@
-import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Conv2D, BatchNormalization, ReLU, MaxPooling2D
+from tensorflow.keras.layers import Conv2D
 
 from Preprocessing.Preprocessor import Preprocessor
 
