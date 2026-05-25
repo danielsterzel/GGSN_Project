@@ -1,4 +1,5 @@
 import tensorflow as tf
+import string
 
 
 class TransformBlock(tf.keras.layers.Layer):
@@ -36,10 +37,9 @@ class TransformBlock(tf.keras.layers.Layer):
         return x
 
 
-class ViT(tf.keras.Model):
+class ViTEncoder(tf.keras.Model):
     def __init__(
         self,
-        num_classes,
         image_size=256,
         patch_size=16,
         embedding_dim=256,
@@ -76,7 +76,6 @@ class ViT(tf.keras.Model):
         ]
 
         self.final_norm = tf.keras.layers.LayerNormalization()
-        self.classifier = tf.keras.layers.Dense(num_classes)
 
     def _prepare_tokens(self, img):
 
@@ -91,7 +90,7 @@ class ViT(tf.keras.Model):
 
         return x
 
-    def call(self, img, training=False):
+    def call(self, img, training=False, return_sequence=False):
         x = self._prepare_tokens(img)
 
         for block in self.transformer_blocks:
@@ -99,8 +98,130 @@ class ViT(tf.keras.Model):
 
         x = self.final_norm(x)
 
+        if return_sequence:
+            return x
+
         cls_output = x[:, 0]
 
-        x = self.classifier(cls_output)
+        return cls_output
 
-        return x
+
+
+class ViT(tf.keras.Model):
+    def __init__(
+        self,
+        num_classes,
+        image_size=256,
+        patch_size=16,
+        embedding_dim=256,
+        num_transformer_blocks=4,
+    ):
+
+        super().__init__()
+
+        self.encoder = ViTEncoder(
+            image_size=image_size,
+            patch_size=patch_size,
+            embedding_dim=embedding_dim,
+            num_transformer_blocks=num_transformer_blocks,
+        )
+        self.classifier = tf.keras.layers.Dense(num_classes)
+
+    def call(self, img, training=False):
+        cls_output = self.encoder(img, training=training)
+
+        return self.classifier(cls_output)
+
+
+class ViTOCR(tf.keras.Model):
+    def __init__(
+        self,
+        vocab_size,
+        image_size=256,
+        patch_size=16,
+        embedding_dim=256,
+        num_transformer_blocks=4,
+    ):
+
+        super().__init__()
+
+        self.encoder = ViTEncoder(
+            image_size=image_size,
+            patch_size=patch_size,
+            embedding_dim=embedding_dim,
+            num_transformer_blocks=num_transformer_blocks,
+        )
+        self.token_projection = tf.keras.layers.Dense(vocab_size)
+
+    def call(self, img, training=False):
+        sequence = self.encoder(img, training=training, return_sequence=True)
+
+        patch_tokens = sequence[:, 1:, :]
+        logits = self.token_projection(patch_tokens)
+
+        return logits
+
+
+class OCRVocabulary:
+    def __init__(self, characters=None):
+        if characters is None:
+            characters = string.ascii_lowercase + string.ascii_uppercase + string.digits
+
+        self.characters = characters
+        self.blank_id = 0
+        self.char_to_id = {char: index + 1 for index, char in enumerate(characters)}
+        self.id_to_char = {index + 1: char for index, char in enumerate(characters)}
+
+    @property
+    def size(self):
+        return len(self.characters) + 1
+
+    def encode(self, text):
+        return [self.char_to_id[char] for char in text if char in self.char_to_id]
+
+    def decode(self, token_ids):
+        decoded_chars = []
+
+        for token_id in token_ids:
+            token_id = int(token_id)
+
+            if token_id == self.blank_id:
+                continue
+
+            char = self.id_to_char.get(token_id)
+            if char is not None:
+                decoded_chars.append(char)
+
+        return "".join(decoded_chars)
+
+
+def build_ctc_input_lengths(batch_size, time_steps):
+    return tf.fill([batch_size, 1], tf.cast(time_steps, tf.int32))
+
+
+def build_ctc_label_lengths(labels):
+    return tf.math.count_nonzero(labels, axis=1, keepdims=True, dtype=tf.int32)
+
+
+def ctc_loss(labels, logits):
+    batch_size = tf.shape(logits)[0]
+    time_steps = tf.shape(logits)[1]
+
+    input_lengths = build_ctc_input_lengths(batch_size, time_steps)
+    label_lengths = build_ctc_label_lengths(labels)
+
+    y_pred = tf.nn.softmax(logits, axis=-1)
+
+    return tf.keras.backend.ctc_batch_cost(labels, y_pred, input_lengths, label_lengths)
+
+
+def greedy_ctc_decode(logits, vocabulary):
+    input_length = tf.fill([tf.shape(logits)[0]], tf.shape(logits)[1])
+    probabilities = tf.nn.softmax(logits, axis=-1)
+    decoded, _ = tf.keras.backend.ctc_decode(
+        probabilities, input_length=input_length, greedy=True
+    )
+
+    token_ids = decoded[0].numpy()
+
+    return [vocabulary.decode(row) for row in token_ids]
