@@ -17,6 +17,11 @@ class OCRDatasetConfig:
 	batch_size: int = 8
 	shuffle_buffer_size: int = 256
 	cache: bool = False
+	augment: bool = False
+	augment_brightness_delta: float = 0.08
+	augment_contrast_lower: float = 0.9
+	augment_contrast_upper: float = 1.1
+	augment_noise_stddev: float = 0.02
 
 
 def read_manifest(
@@ -72,6 +77,25 @@ def encode_text(text, vocabulary):
 	return encoded
 
 
+def augment_image(image, config: OCRDatasetConfig):
+	# OCR-safe augmentations: photometric jitter + mild sensor-like noise.
+	image = tf.image.random_brightness(image, max_delta=config.augment_brightness_delta)
+	image = tf.image.random_contrast(
+		image,
+		lower=config.augment_contrast_lower,
+		upper=config.augment_contrast_upper,
+	)
+	noise = tf.random.normal(
+		shape=tf.shape(image),
+		mean=0.0,
+		stddev=config.augment_noise_stddev,
+		dtype=tf.float32,
+	)
+	image = tf.clip_by_value(image + noise, 0.0, 1.0)
+
+	return image
+
+
 def build_dataset(samples, vocabulary, config: OCRDatasetConfig, training=True):
 	image_paths = [sample.image_path for sample in samples]
 	texts = [sample.text for sample in samples]
@@ -85,6 +109,8 @@ def build_dataset(samples, vocabulary, config: OCRDatasetConfig, training=True):
 
 	def _load_example(image_path, text):
 		image = load_image(image_path, config.image_size)
+		if training and config.augment:
+			image = augment_image(image, config)
 		label = encode_text(text, vocabulary)
 
 		return image, label
