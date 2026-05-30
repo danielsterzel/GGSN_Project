@@ -192,6 +192,23 @@ def run_demo(learning_rate=1e-4):
 	print("[DEMO] loss:", float(loss_value.numpy()))
 	print("[DEMO] predictions:", predictions)
 
+	# Zapisz demo model w formacie SavedModel (przydatne do szybkiego sprawdzenia)
+	demo_save = REPO_ROOT / "artifacts" / "demo_saved_model"
+	demo_save.parent.mkdir(parents=True, exist_ok=True)
+	try:
+		tf.saved_model.save(model, str(demo_save))
+		print(f"[DEMO] Saved demo model to: {demo_save}")
+	except Exception as e:
+		print("[DEMO] Warning: failed to save demo model:", e)
+
+	# Zapisz rowniez wagi demo w formacie HDF5, latwiejszym do wczytania przez Keras
+	demo_weights = REPO_ROOT / "artifacts" / "demo.weights.h5"
+	try:
+		model.save_weights(str(demo_weights))
+		print(f"[DEMO] Saved demo weights to: {demo_weights}")
+	except Exception as e:
+		print("[DEMO] Warning: failed to save demo weights:", e)
+
 
 def train_on_manifest(args):
 	tf.random.set_seed(args.seed)
@@ -358,6 +375,14 @@ def train_on_manifest(args):
 	final_path = output_dir / "final.weights.h5"
 	model.save_weights(final_path)
 	print(f"Zapisano finalne wagi: {final_path}")
+
+	# Zapisz pełny model (SavedModel) obok pliku z wagami
+	saved_model_dir = output_dir / "saved_model"
+	try:
+		tf.saved_model.save(model, str(saved_model_dir))
+		print(f"Zapisano SavedModel w: {saved_model_dir}")
+	except Exception as e:
+		print("Warning: nie udalo sie zapisac SavedModel:", e)
 
 
 def build_arg_parser():

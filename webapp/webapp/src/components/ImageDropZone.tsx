@@ -3,6 +3,9 @@ import { useState } from "react";
 export function ImageDropZone() {
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [prediction, setPrediction] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const allowedTypes = ["image/png", "image/jpeg"];
 
@@ -13,6 +16,37 @@ export function ImageDropZone() {
     }
 
     setFile(selectedFile);
+    setPrediction(null);
+    setError(null);
+    uploadFile(selectedFile);
+  }
+
+  async function uploadFile(selectedFile: File) {
+    setIsUploading(true);
+    setPrediction(null);
+    setError(null);
+
+    const form = new FormData();
+    form.append("file", selectedFile);
+
+    try {
+      const res = await fetch("http://localhost:8000/upload", {
+        method: "POST",
+        body: form,
+      });
+
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      setPrediction(typeof data.prediction === "string" ? data.prediction : JSON.stringify(data));
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setIsUploading(false);
+    }
   }
 
   return (
@@ -92,6 +126,22 @@ export function ImageDropZone() {
             duration-300 rounded-full px-8 py-1 text-white">
           Clear</button>
           </div>
+        )}
+        {isUploading && (
+          <p className="mt-4 text-sm text-neutral-500">Uploading and running OCR…</p>
+        )}
+
+        {prediction !== null && !isUploading && (
+          <div className="mt-4 w-full max-w-2xl bg-gray-50 p-4 rounded-lg">
+            <h3 className="font-semibold">Prediction</h3>
+            <pre className="whitespace-pre-wrap text-sm">
+              {prediction.trim().length > 0 ? prediction : "No text detected"}
+            </pre>
+          </div>
+        )}
+
+        {error && (
+          <div className="mt-4 text-sm text-red-600">Error: {error}</div>
         )}
       </label>
     </div>

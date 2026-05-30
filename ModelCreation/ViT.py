@@ -195,6 +195,46 @@ class OCRVocabulary:
         return "".join(decoded_chars)
 
 
+def _collapse_repeating_text(text, min_pattern_length=1, max_pattern_length=5, min_repetitions=2):
+    if len(text) < 2 * min_repetitions:
+        return text
+
+    max_pattern_length = min(max_pattern_length, len(text) // 2)
+
+    for pattern_length in range(min_pattern_length, max_pattern_length + 1):
+        pattern = text[:pattern_length]
+        repetitions = 0
+        index = 0
+
+        while text.startswith(pattern, index):
+            repetitions += 1
+            index += pattern_length
+
+        if repetitions >= min_repetitions and index / max(1, len(text)) >= 0.8:
+            return pattern
+
+    return text
+
+
+def _should_suppress_text(original_text, filtered_text):
+    if not filtered_text:
+        return True
+
+    if original_text == filtered_text:
+        return False
+
+    original_length = len(original_text)
+    filtered_length = len(filtered_text)
+
+    if original_length >= 8 and filtered_length <= 2:
+        return True
+
+    if original_length >= 12 and filtered_length <= 3:
+        return True
+
+    return False
+
+
 def build_ctc_input_lengths(batch_size, time_steps):
     return tf.fill([batch_size, 1], tf.cast(time_steps, tf.int32))
 
@@ -216,12 +256,32 @@ def ctc_loss(labels, logits):
 
 
 def greedy_ctc_decode(logits, vocabulary):
-    input_length = tf.fill([tf.shape(logits)[0]], tf.shape(logits)[1])
-    probabilities = tf.nn.softmax(logits, axis=-1)
-    decoded, _ = tf.keras.backend.ctc_decode(
-        probabilities, input_length=input_length, greedy=True
-    )
+    logits = tf.convert_to_tensor(logits)
+    token_ids = tf.argmax(logits, axis=-1, output_type=tf.int32).numpy()
 
-    token_ids = decoded[0].numpy()
+    decoded_texts = []
+    for row in token_ids:
+        collapsed = []
+        previous_token = None
 
-    return [vocabulary.decode(row) for row in token_ids]
+        for token_id in row:
+            token_id = int(token_id)
+
+            if token_id == vocabulary.blank_id:
+                previous_token = token_id
+                continue
+
+            if previous_token == token_id:
+                continue
+
+            collapsed.append(token_id)
+            previous_token = token_id
+
+        decoded_text = vocabulary.decode(collapsed)
+        filtered_text = _collapse_repeating_text(decoded_text)
+        if _should_suppress_text(decoded_text, filtered_text):
+            decoded_texts.append("")
+        else:
+            decoded_texts.append(filtered_text)
+
+    return decoded_texts
