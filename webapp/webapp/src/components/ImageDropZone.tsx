@@ -37,7 +37,12 @@ export function ImageDropZone() {
 
       if (!res.ok) {
         const txt = await res.text();
-        throw new Error(txt || `HTTP ${res.status}`);
+        try {
+          const payload = JSON.parse(txt) as { detail?: string };
+          throw new Error(payload.detail || txt || `HTTP ${res.status}`);
+        } catch {
+          throw new Error(txt || `HTTP ${res.status}`);
+        }
       }
 
       const data = await res.json();

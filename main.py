@@ -1,6 +1,7 @@
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import RedirectResponse
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,29 @@ MODEL_CANDIDATES = [
     REPO_ROOT / "ModelCreation" / "saved_model",
     REPO_ROOT / "artifacts" / "demo_saved_model",
 ]
+CONFIG_CANDIDATES = [
+    REPO_ROOT / "artifacts" / "model_config.json",
+    REPO_ROOT / "ModelCreation" / "model_config.json",
+]
+
+
+def _load_model_config() -> dict:
+    for config_path in CONFIG_CANDIDATES:
+        if not config_path.exists():
+            continue
+
+        try:
+            return json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Failed to load model config from {config_path}: {exc}")
+
+    return {
+        "image_size": 256,
+        "patch_size": 16,
+        "embedding_dim": 256,
+        "num_transformer_blocks": 4,
+        "vocabulary": None,
+    }
 
 
 def _find_model_path() -> Optional[Path]:
@@ -39,12 +63,13 @@ MODEL_PATH = _find_model_path()
 MODEL = None
 MODEL_SIGNATURE = None
 VOCAB = None
+MODEL_CONFIG = _load_model_config()
 
 if MODEL_PATH is not None:
     try:
         # Try Keras loader first (works for .keras or legacy formats supported by Keras)
         MODEL = tf.keras.models.load_model(str(MODEL_PATH))
-        VOCAB = OCRVocabulary()
+        VOCAB = OCRVocabulary(characters=MODEL_CONFIG.get("vocabulary") or None)
         print(f"Loaded Keras model from {MODEL_PATH}")
     except Exception as e:
         print("Keras load_model failed, trying tf.saved_model.load:", e)
@@ -57,13 +82,17 @@ if MODEL_PATH is not None:
                 # fallback: try to use loaded as a callable
                 MODEL_SIGNATURE = loaded
 
-            VOCAB = OCRVocabulary()
+            VOCAB = OCRVocabulary(characters=MODEL_CONFIG.get("vocabulary") or None)
             print(f"Loaded SavedModel signatures from {MODEL_PATH}")
         except Exception as e2:
             print("Failed to load SavedModel via tf.saved_model.load:", e2)
         
     # Regardless whether a SavedModel signature exists, try to load HDF5 weights into ViTOCR
     if MODEL is None:
+        image_size = int(MODEL_CONFIG.get("image_size", 256))
+        patch_size = int(MODEL_CONFIG.get("patch_size", 16))
+        embedding_dim = int(MODEL_CONFIG.get("embedding_dim", 256))
+        num_transformer_blocks = int(MODEL_CONFIG.get("num_transformer_blocks", 4))
         WEIGHTS_CANDIDATES = [
             REPO_ROOT / "artifacts" / "best.weights.h5",
             REPO_ROOT / "artifacts" / "final.weights.h5",
@@ -74,10 +103,16 @@ if MODEL_PATH is not None:
         for w in WEIGHTS_CANDIDATES:
             if w.exists():
                 try:
-                    VOCAB = OCRVocabulary()
-                    model = ViTOCR(vocab_size=VOCAB.size)
-                    model.build((None, 256, 256, 3))
-                    dummy = np.zeros((1, 256, 256, 3), dtype=np.float32)
+                    VOCAB = OCRVocabulary(characters=MODEL_CONFIG.get("vocabulary") or None)
+                    model = ViTOCR(
+                        vocab_size=VOCAB.size,
+                        image_size=image_size,
+                        patch_size=patch_size,
+                        embedding_dim=embedding_dim,
+                        num_transformer_blocks=num_transformer_blocks,
+                    )
+                    model.build((None, image_size, image_size, 3))
+                    dummy = np.zeros((1, image_size, image_size, 3), dtype=np.float32)
                     _ = model(dummy, training=False)
                     model.load_weights(str(w))
                     MODEL = model
@@ -148,14 +183,17 @@ app.add_middleware(
 async def upload_image(file: UploadFile = File(...)):
     # Read image
     contents = await file.read()
-    img = Image.open(io.BytesIO(contents))
+    try:
+        img = Image.open(io.BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {exc}")
 
     arr = _preprocess_pil(img)
 
     try:
         texts, shape = predict_from_array(arr)
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {"filename": file.filename, "prediction": texts[0], "logits_shape": shape}
 

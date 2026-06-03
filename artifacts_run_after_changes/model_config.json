@@ -1,0 +1,7 @@
+{
+  "image_size": 256,
+  "patch_size": 16,
+  "embedding_dim": 64,
+  "num_transformer_blocks": 1,
+  "vocabulary": " 0123456789ACDHINORTVWabcdefghilmnoprstuv"
+}

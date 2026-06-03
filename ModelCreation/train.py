@@ -11,6 +11,7 @@ python ModelCreation/train.py --manifest data/manifest.csv --root-dir data --epo
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from pathlib import Path
 import sys
@@ -24,18 +25,38 @@ if str(REPO_ROOT) not in sys.path:
 from DataManagment.OCRData import OCRDatasetConfig, OCRSample, build_dataset, read_manifest
 
 try:
-	from ModelCreation.ViT import OCRVocabulary, ViTOCR, ctc_loss, greedy_ctc_decode
+	from ModelCreation.ViT import (
+		OCRVocabulary,
+		ViTOCR,
+		ctc_loss,
+		greedy_ctc_decode,
+		beam_search_ctc_decode,
+	)
 except ImportError:
 	# Fallback for running from within ModelCreation/ directory.
-	from ViT import OCRVocabulary, ViTOCR, ctc_loss, greedy_ctc_decode
+	from ViT import (
+		OCRVocabulary,
+		ViTOCR,
+		ctc_loss,
+		greedy_ctc_decode,
+		beam_search_ctc_decode,
+	)
 
 
-def build_demo_model(image_size: int = 256, patch_size: int = 16):
-	vocabulary = OCRVocabulary()
+def build_demo_model(
+	image_size: int = 256,
+	patch_size: int = 16,
+	characters: str | None = None,
+	embedding_dim: int = 256,
+	num_transformer_blocks: int = 4,
+):
+	vocabulary = OCRVocabulary(characters=characters) if characters is not None else OCRVocabulary()
 	model = ViTOCR(
 		vocab_size=vocabulary.size,
 		image_size=image_size,
 		patch_size=patch_size,
+		embedding_dim=embedding_dim,
+		num_transformer_blocks=num_transformer_blocks,
 	)
 	return model, vocabulary
 
@@ -168,7 +189,7 @@ def _resolve_manifest_path(manifest_arg: str) -> Path:
 	)
 
 
-def run_demo(learning_rate=1e-4):
+def run_demo(learning_rate=1e-5):
 	model, vocabulary = build_demo_model()
 	optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 
@@ -209,15 +230,28 @@ def run_demo(learning_rate=1e-4):
 	except Exception as e:
 		print("[DEMO] Warning: failed to save demo weights:", e)
 
+	demo_config = REPO_ROOT / "artifacts" / "model_config.json"
+	try:
+		demo_config.write_text(
+			json.dumps(
+				{
+					"image_size": 256,
+					"patch_size": 16,
+					"embedding_dim": 256,
+					"num_transformer_blocks": 4,
+					"vocabulary": vocabulary.characters,
+				},
+				indent=2,
+			),
+			encoding="utf-8",
+		)
+		print(f"[DEMO] Saved model config to: {demo_config}")
+	except Exception as e:
+		print("[DEMO] Warning: failed to save model config:", e)
+
 
 def train_on_manifest(args):
 	tf.random.set_seed(args.seed)
-
-	model, vocabulary = build_demo_model(
-		image_size=args.image_size,
-		patch_size=args.patch_size,
-	)
-	optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
 
 	manifest_path = _resolve_manifest_path(args.manifest)
 	print(f"Uzywam manifestu: {manifest_path}")
@@ -228,6 +262,25 @@ def train_on_manifest(args):
 		image_column=args.image_column,
 		text_column=args.text_column,
 	)
+
+	# Zbuduj słownik tylko z używanych w manifestie znaków, co upraszcza zadanie
+	all_text = "".join(s.text for s in samples)
+	unique_chars = "".join(sorted(set(all_text)))
+	# allow small-model override for faster experiments
+	embedding_dim = args.embedding_dim
+	num_blocks = args.num_transformer_blocks
+	if args.small_model:
+		embedding_dim = max(64, embedding_dim // 4)
+		num_blocks = max(1, num_blocks // 4)
+
+	model, vocabulary = build_demo_model(
+		image_size=args.image_size,
+		patch_size=args.patch_size,
+		characters=unique_chars if unique_chars else None,
+		embedding_dim=embedding_dim,
+		num_transformer_blocks=num_blocks,
+	)
+	optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
 
 	if not samples:
 		raise ValueError("Manifest nie zawiera żadnych próbek.")
@@ -376,6 +429,25 @@ def train_on_manifest(args):
 	model.save_weights(final_path)
 	print(f"Zapisano finalne wagi: {final_path}")
 
+	config_path = output_dir / "model_config.json"
+	try:
+		config_path.write_text(
+			json.dumps(
+				{
+					"image_size": args.image_size,
+					"patch_size": args.patch_size,
+					"embedding_dim": embedding_dim,
+					"num_transformer_blocks": num_blocks,
+					"vocabulary": vocabulary.characters,
+				},
+				indent=2,
+			),
+			encoding="utf-8",
+		)
+		print(f"Zapisano konfigurację modelu: {config_path}")
+	except Exception as e:
+		print("Warning: nie udalo sie zapisac konfiguracji modelu:", e)
+
 	# Zapisz pełny model (SavedModel) obok pliku z wagami
 	saved_model_dir = output_dir / "saved_model"
 	try:
@@ -397,6 +469,13 @@ def build_arg_parser():
 	parser.add_argument("--learning-rate", type=float, default=1e-4)
 	parser.add_argument("--image-size", type=int, default=256)
 	parser.add_argument("--patch-size", type=int, default=16)
+	parser.add_argument("--embedding-dim", type=int, default=256)
+	parser.add_argument("--num-transformer-blocks", type=int, default=4)
+	parser.add_argument(
+		"--small-model",
+		action="store_true",
+		help="Use a smaller model configuration (reduces embedding dim and blocks)",
+	)
 	parser.add_argument("--val-split", type=float, default=0.1)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--cache", action="store_true", help="Cache datasetu tf.data")

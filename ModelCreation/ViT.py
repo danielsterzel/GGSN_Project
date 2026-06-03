@@ -165,19 +165,32 @@ class ViTOCR(tf.keras.Model):
 class OCRVocabulary:
     def __init__(self, characters=None):
         if characters is None:
-            characters = string.ascii_lowercase + string.ascii_uppercase + string.digits
+            characters = (
+                string.ascii_lowercase
+                + string.ascii_uppercase
+                + string.digits
+                + " "
+                + string.punctuation
+            )
 
         self.characters = characters
-        self.blank_id = 0
-        self.char_to_id = {char: index + 1 for index, char in enumerate(characters)}
-        self.id_to_char = {index + 1: char for index, char in enumerate(characters)}
+        # For TensorFlow CTC, the blank symbol must be the last index (num_classes - 1).
+        # Map characters to ids [0..N-1] and reserve blank_id == N.
+        self.char_to_id = {char: index for index, char in enumerate(characters)}
+        self.id_to_char = {index: char for index, char in enumerate(characters)}
+        self.blank_id = len(characters)
 
     @property
     def size(self):
         return len(self.characters) + 1
 
     def encode(self, text):
-        return [self.char_to_id[char] for char in text if char in self.char_to_id]
+        missing_chars = sorted({char for char in text if char not in self.char_to_id})
+        if missing_chars:
+            missing_display = ", ".join(repr(char) for char in missing_chars)
+            raise ValueError(f"Unsupported OCR characters: {missing_display}")
+
+        return [self.char_to_id[char] for char in text]
 
     def decode(self, token_ids):
         decoded_chars = []
@@ -267,10 +280,12 @@ def greedy_ctc_decode(logits, vocabulary):
         for token_id in row:
             token_id = int(token_id)
 
+            # skip blanks
             if token_id == vocabulary.blank_id:
                 previous_token = token_id
                 continue
 
+            # collapse consecutive duplicates
             if previous_token == token_id:
                 continue
 
@@ -278,10 +293,34 @@ def greedy_ctc_decode(logits, vocabulary):
             previous_token = token_id
 
         decoded_text = vocabulary.decode(collapsed)
-        filtered_text = _collapse_repeating_text(decoded_text)
-        if _should_suppress_text(decoded_text, filtered_text):
-            decoded_texts.append("")
-        else:
-            decoded_texts.append(filtered_text)
+        decoded_texts.append(decoded_text)
 
     return decoded_texts
+
+
+def beam_search_ctc_decode(logits, vocabulary, beam_width=10, top_paths=1):
+    """Decode logits with TensorFlow CTC beam search decoder and return top path strings.
+
+    logits: array-like (batch, time, num_classes)
+    """
+    logits = tf.convert_to_tensor(logits)
+    # TF CTC expects time-major inputs: (time, batch, num_classes)
+    inputs = tf.transpose(logits, perm=[1, 0, 2])
+    batch_size = tf.shape(logits)[0]
+    time_steps = tf.shape(logits)[1]
+
+    seq_len = tf.fill([batch_size], tf.cast(time_steps, tf.int32))
+
+    decoded, log_prob = tf.nn.ctc_beam_search_decoder(inputs, seq_len, beam_width=beam_width, top_paths=top_paths)
+
+    # decoded is a list of SparseTensors (top_paths long). We'll take the first path.
+    sparse_decoded = decoded[0]
+    dense = tf.sparse.to_dense(sparse_decoded, default_value=vocabulary.blank_id)
+    dense_np = dense.numpy()
+
+    texts = []
+    for row in dense_np:
+        token_ids = [int(t) for t in row if int(t) != vocabulary.blank_id]
+        texts.append(vocabulary.decode(token_ids))
+
+    return texts
