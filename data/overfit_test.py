@@ -37,7 +37,7 @@ labels = tf.convert_to_tensor(labels_padded)
 def train_step(images, labels):
     with tf.GradientTape() as tape:
         logits = model(images, training=True)
-        loss = tf.reduce_mean(ctc_loss(labels, logits))
+        loss = tf.reduce_mean(ctc_loss(labels, logits, blank_id=vocab.blank_id))
     grads = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     return loss, logits

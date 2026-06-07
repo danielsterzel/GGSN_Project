@@ -1,7 +1,0 @@
-{
-  "image_size": 256,
-  "patch_size": 16,
-  "embedding_dim": 256,
-  "num_transformer_blocks": 4,
-  "vocabulary": " 123ABCHILORSTaeilmnopstwx"
-}

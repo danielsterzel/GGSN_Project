@@ -123,7 +123,8 @@ def build_dataset(samples, vocabulary, config: OCRDatasetConfig, training=True):
 	dataset = dataset.padded_batch(
 		config.batch_size,
 		padded_shapes=([config.image_size[0], config.image_size[1], 3], [None]),
-		padding_values=(tf.constant(0.0, tf.float32), tf.constant(vocabulary.blank_id, tf.int32)),
+		# pad images with 0.0 and labels with 0 (reserved padding id)
+		padding_values=(tf.constant(0.0, tf.float32), tf.constant(0, tf.int32)),
 		drop_remainder=False,
 	)
 

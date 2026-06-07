@@ -18,6 +18,12 @@ import sys
 
 import tensorflow as tf
 
+try:
+	sys.stdout.reconfigure(encoding="utf-8")
+	sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+	pass
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
 	sys.path.insert(0, str(REPO_ROOT))
@@ -49,6 +55,7 @@ def build_demo_model(
 	characters: str | None = None,
 	embedding_dim: int = 256,
 	num_transformer_blocks: int = 4,
+	blank_bias: float = 0.0,
 ):
 	vocabulary = OCRVocabulary(characters=characters) if characters is not None else OCRVocabulary()
 	model = ViTOCR(
@@ -57,14 +64,15 @@ def build_demo_model(
 		patch_size=patch_size,
 		embedding_dim=embedding_dim,
 		num_transformer_blocks=num_transformer_blocks,
+		blank_bias=blank_bias,
 	)
 	return model, vocabulary
 
 
-def train_step(model, images, labels, optimizer):
+def train_step(model, images, labels, optimizer, blank_id=None):
 	with tf.GradientTape() as tape:
 		logits = model(images, training=True)
-		loss_value = tf.reduce_mean(ctc_loss(labels, logits))
+		loss_value = tf.reduce_mean(ctc_loss(labels, logits, blank_id=blank_id))
 
 	gradients = tape.gradient(loss_value, model.trainable_variables)
 	optimizer.apply_gradients(zip(gradients, model.trainable_variables))
@@ -72,9 +80,9 @@ def train_step(model, images, labels, optimizer):
 	return loss_value, logits
 
 
-def eval_step(model, images, labels):
+def eval_step(model, images, labels, blank_id=None):
 	logits = model(images, training=False)
-	loss_value = tf.reduce_mean(ctc_loss(labels, logits))
+	loss_value = tf.reduce_mean(ctc_loss(labels, logits, blank_id=blank_id))
 	return loss_value, logits
 
 
@@ -128,6 +136,20 @@ def _sequence_metrics(labels, logits, vocabulary):
 	seq_acc = seq_matches / len(target_texts)
 	char_acc = char_acc_sum / len(target_texts)
 	return char_acc, seq_acc
+
+
+def _prediction_diagnostics(logits, vocabulary):
+	pred_texts = greedy_ctc_decode(logits, vocabulary)
+	token_ids = tf.argmax(logits, axis=-1, output_type=tf.int32)
+
+	blank_rate = tf.reduce_mean(
+		tf.cast(tf.equal(token_ids, vocabulary.blank_id), tf.float32)
+	)
+	probs = tf.nn.softmax(logits, axis=-1)
+	mean_max_prob = tf.reduce_mean(tf.reduce_max(probs, axis=-1))
+	empty_rate = sum(1 for text in pred_texts if text == "") / max(1, len(pred_texts))
+
+	return float(blank_rate.numpy()), empty_rate, float(mean_max_prob.numpy())
 
 
 def _split_samples(samples, val_split=0.1, seed=42):
@@ -191,7 +213,7 @@ def _resolve_manifest_path(manifest_arg: str) -> Path:
 
 def run_demo(learning_rate=1e-5):
 	model, vocabulary = build_demo_model()
-	optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+	optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
 
 	dummy_samples = [
 		OCRSample(image_path="dummy_1.png", text="test"),
@@ -200,7 +222,7 @@ def run_demo(learning_rate=1e-5):
 	dummy_images = tf.random.normal((2, 256, 256, 3))
 	dummy_labels = tf.ragged.constant(
 		[vocabulary.encode(sample.text) for sample in dummy_samples], dtype=tf.int32
-	).to_tensor(default_value=vocabulary.blank_id)
+		).to_tensor(default_value=0)
 
 	loss_value, logits = train_step(
 		model=model,
@@ -262,10 +284,23 @@ def train_on_manifest(args):
 		image_column=args.image_column,
 		text_column=args.text_column,
 	)
+	if args.max_samples is not None:
+		samples = samples[: args.max_samples]
+		print(f"Debug subset: using first {len(samples)} samples (--max-samples).")
 
 	# Zbuduj słownik tylko z używanych w manifestie znaków, co upraszcza zadanie
 	all_text = "".join(s.text for s in samples)
 	unique_chars = "".join(sorted(set(all_text)))
+
+	# Estimate available time-steps for ViT model: (image_size // patch_size)^2
+	patches_per_side = max(1, args.image_size // args.patch_size)
+	time_steps = patches_per_side * patches_per_side
+	# allow labels up to number of time-steps (conservative)
+	max_label_len = max(1, time_steps)
+	filtered_samples = [s for s in samples if len(s.text) <= max_label_len]
+	if len(filtered_samples) < len(samples):
+		print(f"Filtered {len(samples)-len(filtered_samples)} samples longer than {max_label_len} tokens (time_steps={time_steps}). Using {len(filtered_samples)} samples")
+		samples = filtered_samples
 	# allow small-model override for faster experiments
 	embedding_dim = args.embedding_dim
 	num_blocks = args.num_transformer_blocks
@@ -279,8 +314,12 @@ def train_on_manifest(args):
 		characters=unique_chars if unique_chars else None,
 		embedding_dim=embedding_dim,
 		num_transformer_blocks=num_blocks,
+		blank_bias=args.blank_bias,
 	)
-	optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+	optimizer = tf.keras.optimizers.Adam(
+		learning_rate=args.learning_rate,
+		clipnorm=args.clipnorm if args.clipnorm > 0 else None,
+	)
 
 	if not samples:
 		raise ValueError("Manifest nie zawiera żadnych próbek.")
@@ -351,52 +390,84 @@ def train_on_manifest(args):
 		train_norm_losses = []
 		train_char_accs = []
 		train_seq_accs = []
+		train_blank_rates = []
+		train_empty_rates = []
+		train_mean_max_probs = []
 
 		for images, labels in train_ds:
-			loss_value, logits = train_step(model, images, labels, optimizer)
+			loss_value, logits = train_step(model, images, labels, optimizer, blank_id=vocabulary.blank_id)
 			train_losses.append(float(loss_value.numpy()))
 			time_steps = float(tf.shape(logits)[1].numpy())
 			train_norm_losses.append(float(loss_value.numpy()) / max(1.0, time_steps))
 			char_acc, seq_acc = _sequence_metrics(labels, logits, vocabulary)
 			train_char_accs.append(char_acc)
 			train_seq_accs.append(seq_acc)
+			blank_rate, empty_rate, mean_max_prob = _prediction_diagnostics(logits, vocabulary)
+			train_blank_rates.append(blank_rate)
+			train_empty_rates.append(empty_rate)
+			train_mean_max_probs.append(mean_max_prob)
 
 		train_loss = sum(train_losses) / max(1, len(train_losses))
 		train_loss_norm = sum(train_norm_losses) / max(1, len(train_norm_losses))
 		train_char_acc = sum(train_char_accs) / max(1, len(train_char_accs))
 		train_seq_acc = sum(train_seq_accs) / max(1, len(train_seq_accs))
+		train_blank_rate = sum(train_blank_rates) / max(1, len(train_blank_rates))
+		train_empty_rate = sum(train_empty_rates) / max(1, len(train_empty_rates))
+		train_mean_max_prob = sum(train_mean_max_probs) / max(1, len(train_mean_max_probs))
 
 		if val_ds is not None:
 			val_losses = []
 			val_norm_losses = []
 			val_char_accs = []
 			val_seq_accs = []
+			val_blank_rates = []
+			val_empty_rates = []
+			val_mean_max_probs = []
 			for images, labels in val_ds:
-				val_loss_value, val_logits = eval_step(model, images, labels)
+				val_loss_value, val_logits = eval_step(model, images, labels, blank_id=vocabulary.blank_id)
 				val_losses.append(float(val_loss_value.numpy()))
 				time_steps = float(tf.shape(val_logits)[1].numpy())
 				val_norm_losses.append(float(val_loss_value.numpy()) / max(1.0, time_steps))
 				char_acc, seq_acc = _sequence_metrics(labels, val_logits, vocabulary)
 				val_char_accs.append(char_acc)
 				val_seq_accs.append(seq_acc)
+				blank_rate, empty_rate, mean_max_prob = _prediction_diagnostics(val_logits, vocabulary)
+				val_blank_rates.append(blank_rate)
+				val_empty_rates.append(empty_rate)
+				val_mean_max_probs.append(mean_max_prob)
 
 			val_loss = sum(val_losses) / max(1, len(val_losses))
 			val_loss_norm = sum(val_norm_losses) / max(1, len(val_norm_losses))
 			val_char_acc = sum(val_char_accs) / max(1, len(val_char_accs))
 			val_seq_acc = sum(val_seq_accs) / max(1, len(val_seq_accs))
+			val_blank_rate = sum(val_blank_rates) / max(1, len(val_blank_rates))
+			val_empty_rate = sum(val_empty_rates) / max(1, len(val_empty_rates))
+			val_mean_max_prob = sum(val_mean_max_probs) / max(1, len(val_mean_max_probs))
 		else:
 			val_loss = train_loss
 			val_loss_norm = train_loss_norm
 			val_char_acc = train_char_acc
 			val_seq_acc = train_seq_acc
+			val_blank_rate = train_blank_rate
+			val_empty_rate = train_empty_rate
+			val_mean_max_prob = train_mean_max_prob
 
 		print(
 			f"Epoch {epoch:03d}/{args.epochs} "
 			f"train_loss={train_loss:.4f} train_loss_norm={train_loss_norm:.4f} "
 			f"train_char_acc={train_char_acc:.4f} train_seq_acc={train_seq_acc:.4f} "
+			f"train_blank_rate={train_blank_rate:.4f} train_empty_rate={train_empty_rate:.4f} "
+			f"train_mean_max_prob={train_mean_max_prob:.4f} "
 			f"val_loss={val_loss:.4f} val_loss_norm={val_loss_norm:.4f} "
-			f"val_char_acc={val_char_acc:.4f} val_seq_acc={val_seq_acc:.4f}"
+			f"val_char_acc={val_char_acc:.4f} val_seq_acc={val_seq_acc:.4f} "
+			f"val_blank_rate={val_blank_rate:.4f} val_empty_rate={val_empty_rate:.4f} "
+			f"val_mean_max_prob={val_mean_max_prob:.4f}"
 		)
+		if val_empty_rate >= args.empty_prediction_warning_rate:
+			print(
+				"WARNING: OCR predictions are mostly empty. "
+				"Check blank_rate, label lengths, and whether the model can overfit a tiny batch."
+			)
 
 		checkpoint_manager.save()
 
@@ -439,6 +510,7 @@ def train_on_manifest(args):
 					"embedding_dim": embedding_dim,
 					"num_transformer_blocks": num_blocks,
 					"vocabulary": vocabulary.characters,
+					"blank_bias": args.blank_bias,
 				},
 				indent=2,
 			),
@@ -464,13 +536,32 @@ def build_arg_parser():
 	parser.add_argument("--image-column", type=str, default="image_path")
 	parser.add_argument("--text-column", type=str, default="text")
 	parser.add_argument("--output-dir", type=str, default="artifacts")
+	parser.add_argument(
+		"--max-samples",
+		type=int,
+		default=None,
+		help="Use only the first N manifest samples for quick overfit/debug runs.",
+	)
 	parser.add_argument("--epochs", type=int, default=5)
 	parser.add_argument("--batch-size", type=int, default=8)
 	parser.add_argument("--learning-rate", type=float, default=1e-4)
+	parser.add_argument("--clipnorm", type=float, default=1.0)
 	parser.add_argument("--image-size", type=int, default=256)
 	parser.add_argument("--patch-size", type=int, default=16)
 	parser.add_argument("--embedding-dim", type=int, default=256)
 	parser.add_argument("--num-transformer-blocks", type=int, default=4)
+	parser.add_argument(
+		"--blank-bias",
+		type=float,
+		default=0.0,
+		help="Initial bias for the CTC blank class. Keep at 0 unless experimenting.",
+	)
+	parser.add_argument(
+		"--empty-prediction-warning-rate",
+		type=float,
+		default=0.9,
+		help="Warn when this fraction of decoded predictions is empty.",
+	)
 	parser.add_argument(
 		"--small-model",
 		action="store_true",
